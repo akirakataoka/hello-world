@@ -1,0 +1,281 @@
+<package>
+<job id="Report">
+<script language="VBScript">
+Option Explicit
+'On Error Resume Next
+
+Const ForReading = 1, ForWriting = 2, ForAppending = 8
+Const TristateUseDefault = -2, TristateTrue = -1, TristateFalse = 0
+
+Dim access, dbe, db, dbFilePath
+Dim fso, reg
+Dim homeDir, outputDir, timeStmp, startTime
+
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set reg = new RegExp
+
+If Instr(WScript.FullName, "WScript.exe") Then WScript.Quit(1)
+
+WScript.Echo "--------------------------------------------------------------"
+WScript.Echo Trim(Date) + " " + Trim(startTime) + "  Report作成 開始"
+WScript.Echo "--------------------------------------------------------------"
+
+If NOT WScript.Arguments.Named.Exists("HOMEDIR") Then WScript.Echo "引数/HOMEDIR:を指定してください。" :WScript.Quit
+If NOT WScript.Arguments.Named.Exists("OUTPUT") Then WScript.Echo "引数/OUTPUT:を指定してください。" :WScript.Quit
+
+homeDir = (fso.GetFolder(WScript.Arguments.Named.Item("HOMEDIR"))).Path
+outputDir = (fso.GetFolder(WScript.Arguments.Named.Item("OUTPUT"))).Path
+
+startTime = Time
+timeStmp = Replace(Replace(Replace(Date + startTime,"/","-"),":","")," ","_")
+
+If Not(Err.Number = 0) Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source :WScript.Quit(1)
+
+' DBファイルの新規作成
+Set access = CreateObject("Access.Application") :access.visible = false
+Set dbe = access.DBEngine
+Const DB_LANG_JAPANESE = ";LANGID=0x0411;CP=932;COUNTRY=0"
+dbFilePath = outputDir + "\" + timeStmp + ".accdb"
+Set db = dbe.CreateDatabase(dbFilePath, DB_LANG_JAPANESE)
+db.Close
+
+WScript.Echo "--------------------------------------------------------------"
+
+' マクロ&モジュールインポート
+If fso.FileExists(homeDir & "\data&project.accdb") Then Call ImportDataProject(dbFilePath)
+If Err.Number <> 0 Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source :WScript.Quit(1)
+
+WScript.Echo "--------------------------------------------------------------"
+
+' テキストデータインポート
+Call ImportText(dbFilePath)
+If Err.Number <> 0 Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source :WScript.Quit(1)
+
+WScript.Echo "--------------------------------------------------------------"
+
+' クエリインポート
+Call ImportQuery(dbFilePath)
+If Err.Number <> 0 Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source :WScript.Quit(1)
+
+WScript.Echo "--------------------------------------------------------------"
+
+WScript.Echo "--------------------------------------------------------------"
+WScript.Echo Trim(Time) + " 帳票ファイル出力先:" + outputDir
+WScript.Echo "--------------------------------------------------------------"
+WScript.Echo Trim(Date) + " " + Trim(Time) + ": Report作成 終了"
+WScript.Echo "合計:" + Trim(DateDiff("s", startTime, Time)) + "秒経過"
+WScript.Echo "--------------------------------------------------------------"
+
+access.Quit
+WScript.Quit
+
+Function ImportText(dbFilePath)
+	Dim dbe, db, tab, field, prop
+	Dim file, text, sfldr, dfldr
+	Dim tempDic
+	Dim sqlStr, tabStr, keyStr, textStr, lineStr, colStr, descStr
+	Dim counter
+
+	'schema.iniの作成
+	Set sfldr = fso.GetFolder(homeDir + "\schema")
+
+	Set tempDic = CreateObject("Scripting.Dictionary")
+	For Each file In sfldr.files: Do
+		If InStr(file.name, "IN_") <> 1 Then Exit Do
+		Set text = file.OpenAsTextStream(ForReading, TristateUseDefault)
+		textStr = ""
+		Do While text.AtEndOfStream <> True
+			lineStr = text.ReadLine
+			If InStr(lineStr, "'") Then lineStr = Replace(Split(lineStr, "'")(0), vbTab, "")
+			textStr = textStr & vbCrLf & lineStr
+		Loop
+		tempDic.Add Replace(fso.GetBaseName(file.name), "IN_", ""), textStr
+		text.close
+	Loop Until 1: Next
+
+	Set text = fso.CreateTextFile(homeDir & "\data\schema.ini", True)
+	Set dfldr = fso.GetFolder(homeDir + "\data")
+
+	For Each file In dfldr.files
+		For Each keyStr In tempDic.Keys
+			If InStr(file.name, fso.GetBaseName(keyStr)) Then
+				text.WriteLine Replace(tempDic.Item(keyStr), "$FILE_NAME$", file.name)
+			End If
+		Next
+	Next
+	text.close
+
+	If Not(Err.Number = 0) Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source & "(" & fileName & ")" :WScript.Quit(1)
+	WScript.Echo Trim(Time) + "  >>>  schema.iniファイルを作成しました。"
+
+	'テキストファイルのインポート
+	Set dbe = access.DBEngine
+	Set db = dbe.OpenDatabase(dbFilePath)
+
+	For Each file In dfldr.files: Do
+		If file.name = "schema.ini" Then Exit Do
+
+		For Each keyStr In tempDic.Keys
+			If InStr(file.name, keyStr) Then tabStr = keyStr
+		Next
+
+		counter = 0
+		For Each tab In db.TableDefs
+			If tabStr = tab.name Then counter = counter + 1
+		Next
+
+		If counter = 0 Then
+			'sqlStr = "SELECT $PREFIX$ AS Prefix, * INTO $TABLE$ FROM $TEXTFILE$"
+			sqlStr = "SELECT * INTO $TABLE$ FROM $TEXTFILE$"
+		Else
+			'sqlStr = "INSERT INTO $TABLE$ SELECT $PREFIX$ AS Prefix, * FROM $TEXTFILE$"
+			sqlStr = "INSERT INTO $TABLE$ SELECT * FROM $TEXTFILE$"
+		End If
+
+		'sqlStr = Replace(sqlStr, "$PREFIX$", Replace(fso.GetBaseName(file.name), tabStr, ""))
+		sqlStr = Replace(sqlStr, "$TABLE$", tabStr)
+
+		If fso.GetExtensionName(file.Name) = "txt" Then
+			sqlStr = Replace(sqlStr, "$TEXTFILE$", "[Text;FMT=Delimited;HDR=Yes;DATABASE=" + dfldr.path + ";].[" + fso.GetBaseName(file.name) + "#txt];")
+		ElseIf fso.GetExtensionName(file.Name) = "csv" Then
+			sqlStr = Replace(sqlStr, "$TEXTFILE$", "[Text;FMT=Delimited;HDR=Yes;DATABASE=" + dfldr.path + ";].[" + fso.GetBaseName(file.name) + "#csv];")
+		
+		End IF
+		db.Execute  sqlStr
+
+		db.TableDefs.Refresh
+
+		If Err.Number <> 0 Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source & "(" & file.name & ")" :db.close :WScript.Quit(1)
+		WScript.Echo Trim(Time) + "  >>>  " + file.name + "ファイルをインポートしました。"
+	Loop Until 1: Next
+
+	'テーブルのフィールドの説明追記
+	For Each file In sfldr.files: Do
+		If InStr(file.name, "IN_") <> 1 Then Exit Do
+		Set text = file.OpenAsTextStream(ForReading, TristateUseDefault)
+		tabStr = Replace(fso.GetBaseName(file.name), "IN_", "")
+		Do While text.AtEndOfStream <> True: Do
+			lineStr = text.ReadLine
+			If InStr(UCase(Trim(lineStr)), "COL") <> 1 Then Exit Do
+			If InStr(lineStr, "'") = 0 Then Exit Do
+
+			colStr = Split(Split(Split(lineStr, "'")(0), "=")(1), " ")(0)
+			descStr = Split(lineStr, "'")(1)
+
+			Set tab = db.TableDefs(tabStr)
+			For Each field In tab.Fields
+				If field.Name = colStr Then
+					Set prop = field.CreateProperty("Description", 10, descStr)
+					field.Properties.Append prop
+				End If
+			Next
+		Loop Until 1: Loop
+		text.close
+	Loop Until 1: Next
+
+	db.Close
+End Function
+
+Function ImportQuery(dbFilePath)
+	Dim dbe, db, query
+	Dim cfgDic
+	Dim dfldr, qfldr, file, text
+	Dim sqlStr, keyStr, line, cols, counter
+
+	'設定ファイル(config.ini)の読み込み
+	Set text = fso.OpenTextFile(homeDir + "\config.ini", ForReading)
+	Set dfldr = fso.GetFolder(homeDir + "\data")
+	Set cfgDic = CreateObject("Scripting.Dictionary")
+	Do Until text.AtEndOfStream = True
+		line = text.ReadLine
+
+		reg.Pattern = "^.+=.+"
+		If NOT reg.Test(line) AND Len(line) <> 0 Then
+			WScript.Echo "Error-U101 config.iniのフォーマットが不正です。" + line :WScript.Quit(1)
+		ElseIf Len(line) <> 0 Or Left(line, 1) = "'" Then
+			cols = Split(line,"=")
+
+			If cfgDic.Exists(Trim(cols(0))) Then WScript.Echo "Error-U102 config.iniファイルで" + Trim(cols(0)) + "が重複しています。" :WScript.Quit(1)
+
+			counter = 0
+			For Each file in dfldr.files
+				If InStr(file.name, cols(1)) Then counter = counter + 1
+			Next
+			'If counter = 0 Then WScript.Echo "Error-U103 " & Trim(cols(1)) & "のデータファイルがありません。" :WScript.Quit(1)
+
+			cfgDic.Add Trim(cols(0)), Trim(cols(1))
+		End If
+	Loop
+
+	If Err.Number <> 0 Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source & "(config.ini)" :WScript.Quit(1)
+	WScript.Echo Trim(Time) + "  >>>  config.iniファイルのチェックが正常終了しました。"
+
+	Set dbe = access.DBEngine
+	Set db = dbe.OpenDatabase(dbFilePath)
+	Set qfldr = fso.GetFolder(homeDir + "\query")
+
+	For Each file in qfldr.files
+		Set text = file.OpenAsTextStream(ForReading, TristateUseDefault)
+		sqlStr = text.ReadAll
+
+		For Each keyStr In cfgDic.keys
+			sqlStr = Replace(sqlStr, keyStr, cfgDic.Item(keyStr))
+		Next
+
+		Set query = db.CreateQueryDef(fso.GetBaseName(file.name), sqlStr)
+
+		If Err.Number <> 0 Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source & "(" & file.name & ")" :db.close :WScript.Quit(1)
+		WScript.Echo Trim(Time) + "  >>>  " + file.name + "ファイルをインポートしました。"
+		text.Close
+	Next
+	db.Close
+
+End Function
+
+Function ImportDataProject(dbFilePath)
+	Dim macro, module, table
+
+	Const acExport = 1, acImport = 0, acLink = 2
+	Const acMacro = 4, acModule = 5, acTable = 0
+
+	access.OpenCurrentDatabase(homeDir & "\data&project.accdb")
+
+	'MSysIMEXSpecs,MSysIMEXColumns
+	For Each table In access.CurrentData.AllTables: Do
+		If Left(table.Name,4) = "MSys" AND table.Name <> "MSysIMEXSpecs" AND table.Name <> "MSysIMEXColumns" Then Exit Do
+
+		access.DoCmd.TransferDatabase acExport, "Microsoft Access", dbFilePath, acTable, table.Name, table.Name
+	
+		If Not(Err.Number = 0) Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source & "(" & table.name & ")" :access.Quit :WScript.Quit(1)
+		WScript.Echo Trim(Time) + "  >>>  " + table.name + "テーブルをインポートしました。"
+	Loop Until 1: Next
+
+	For Each macro In access.CurrentProject.AllMacros
+		access.DoCmd.TransferDatabase acExport, "Microsoft Access", dbFilePath, acMacro, macro.Name, macro.Name
+	
+		If Not(Err.Number = 0) Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source & "(" & macro.name & ")" :access.Quit :WScript.Quit(1)
+		WScript.Echo Trim(Time) + "  >>>  " + macro.name + "マクロをインポートしました。"
+	Next
+
+	For Each module In access.CurrentProject.AllModules
+		access.DoCmd.TransferDatabase acExport, "Microsoft Access", dbFilePath, acModule, module.Name, module.Name
+	
+		If Not(Err.Number = 0) Then WScript.Echo "Error-" & CStr(Err.Number) & " " & Err.Description & Err.Source & "(" & module.name & ")" :access.Quit :WScript.Quit(1)
+		WScript.Echo Trim(Time) + "  >>>  " + module.name + "モジュールをインポートしました。"
+	Next
+
+	access.CloseCurrentDatabase
+
+	'access.OpenCurrentDatabase(dbFilePath)
+	'access.DoCmd.RunMacro "参照設定"
+	'access.DoCmd.DeleteObject acMacro, "参照設定"
+	'access.DoCmd.DeleteObject acModule, "参照設定"
+	'WScript.Echo Trim(Time) + "  >>>  参照設定を実行し、該当のマクロ・モジュールを削除しました。"
+
+	'access.CloseCurrentDatabase
+
+End Function
+
+</script>
+</job>
+</package>
